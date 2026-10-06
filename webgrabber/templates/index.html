@@ -77,6 +77,26 @@
         border: 1px solid var(--border);
         white-space: pre-wrap;
       }
+      #download-controls {
+        display: none;
+        margin-top: 20px;
+        border-top: 1px solid var(--border);
+        padding-top: 16px;
+      }
+      #download-controls > label {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      #download-controls input[type="radio"] {
+        width: 18px;
+        height: 18px;
+        accent-color: var(--accent);
+      }
+      #download-controls .row input {
+        width: 100%;
+        height: auto;
+      }
       @media (max-width: 700px) {
         .row { grid-template-columns: 1fr; }
       }
@@ -86,59 +106,52 @@
     <div class="wrap">
       <div class="panel">
         <h1>WebGrabber</h1>
-        <div class="meta">Hosted on <strong>{{ hostname }}</strong> for web-based crawl jobs.</div>
+        <div class="meta">Webbplatsanalys och hämtning</div>
 
         <form id="crawl-form">
           <label for="start_url">Webbplats eller domän</label>
           <input id="start_url" type="text" value="https://example.com" required>
-
-          <div class="row">
-            <div>
-              <label for="max_pages">Max antal sidor</label>
-              <input id="max_pages" type="number" value="200" min="1">
-            </div>
-            <div>
-              <label for="max_depth">Crawl-djup</label>
-              <input id="max_depth" type="number" value="3" min="0">
-            </div>
-          </div>
-
-          <div class="row">
-            <div>
-              <label for="max_file_size_mb">Max filstorlek (MB)</label>
-              <input id="max_file_size_mb" type="number" value="50" min="1">
-            </div>
-            <div>
-              <label for="include_files">Hämta filer</label>
-              <select id="include_files">
-                <option value="true" selected>Ja</option>
-                <option value="false">Nej</option>
-              </select>
-            </div>
-          </div>
-
-          <button type="submit">Starta crawl</button>
+          <p>Webbplatsen analyseras först, upp till 200 sidor och djup 5. Därefter väljer du hämtningsomfattning.</p>
+          <button type="submit">Analysera webbplats</button>
         </form>
 
-        <div id="result">Redo för att starta crawl.</div>
+        <div id="result" aria-live="polite">Redo för att analysera en webbplats.</div>
+        <form id="download-controls">
+          <div class="row">
+            <div>
+              <label for="max_pages">Hämta högst antal sidor</label>
+              <input id="max_pages" type="number" value="200" min="1" max="200" required>
+            </div>
+            <div>
+              <label for="max_depth">Maxdjup</label>
+              <input id="max_depth" type="number" value="5" min="0" max="5" required>
+            </div>
+          </div>
+          <strong>Vad vill du hämta?</strong>
+          <label><input type="radio" name="mode" value="text" checked>Hämta enbart text</label>
+          <label><input type="radio" name="mode" value="all">Hämta allt innehåll</label>
+          <button type="submit">Hämta som ZIP</button>
+        </form>
       </div>
     </div>
 
     <script>
       const form = document.getElementById('crawl-form');
+      const downloadForm = document.getElementById('download-controls');
       const result = document.getElementById('result');
+      let currentJobId = null;
 
       form.addEventListener('submit', async (event) => {
         event.preventDefault();
         const payload = {
           start_url: document.getElementById('start_url').value.trim(),
-          max_pages: Number(document.getElementById('max_pages').value) || null,
-          max_depth: Number(document.getElementById('max_depth').value) || 3,
-          max_file_size_mb: Number(document.getElementById('max_file_size_mb').value) || null,
-          include_files: document.getElementById('include_files').value === 'true'
+          max_pages: 200,
+          max_depth: 5
         };
 
-        result.textContent = 'Startar jobb...';
+        downloadForm.style.display = 'none';
+        currentJobId = null;
+        result.textContent = 'Analyserar sidor och länkar...';
 
         const response = await fetch('/api/start', {
           method: 'POST',
@@ -155,14 +168,67 @@
         const poll = async () => {
           const statusResponse = await fetch(`/api/jobs/${data.job_id}`);
           const statusData = await statusResponse.json();
-          result.textContent = JSON.stringify(statusData, null, 2);
-          if (statusData.status === 'complete' || statusData.status === 'failed' || statusData.status === 'cancelled') {
+          if (statusData.status === 'failed' || statusData.status === 'cancelled') {
+            result.textContent = statusData.error || 'Analysen misslyckades.';
+            return;
+          }
+          if (['complete', 'time_limit', 'limit_reached'].includes(statusData.status)) {
+            currentJobId = statusData.job_id;
+            const domains = statusData.external_domains.length
+              ? statusData.external_domains.join(', ')
+              : 'Inga externa domäner eller subdomäner hittades';
+            const types = Object.entries(statusData.file_types)
+              .map(([type, count]) => `${type}: ${count}`).join(', ') || 'Inga filer hittades';
+            document.getElementById('max_pages').value = Math.max(1, statusData.pages.length);
+            document.getElementById('max_depth').value = statusData.max_depth_reached;
+            result.textContent = [
+              `Webbsidor hittade: ${statusData.pages.length}`,
+              `Djup som analyserats: ${statusData.max_depth_reached}`,
+              `Interna sidlänkar: ${statusData.linked_pages.length}`,
+              `Länkade filer: ${statusData.file_count}`,
+              `Filtyper: ${types}`,
+              `Analyserad datamängd: ${(statusData.estimated_bytes / (1024 * 1024)).toFixed(2)} MB`,
+              `Domäner/subdomäner (${statusData.external_domains.length}): ${domains}`,
+              `Analysstatus: ${statusData.status}${statusData.limit_reason ? ` (${statusData.limit_reason})` : ''}`
+            ].join('\\n');
+            downloadForm.style.display = 'block';
             return;
           }
           setTimeout(poll, 1500);
         };
 
         poll();
+      });
+
+      downloadForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (!currentJobId) return;
+        result.textContent = 'Förbereder ZIP...';
+        const mode = new FormData(downloadForm).get('mode');
+        const response = await fetch('/api/download', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            job_id: currentJobId,
+            mode,
+            max_pages: Number(document.getElementById('max_pages').value),
+            max_depth: Number(document.getElementById('max_depth').value)
+          })
+        });
+        if (!response.ok) {
+          const data = await response.json();
+          result.textContent = data.error || 'Kunde inte skapa ZIP-filen.';
+          return;
+        }
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = objectUrl;
+        link.download = `webgrabber-${currentJobId}.zip`;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+        result.textContent = 'ZIP-filen har hämtats.';
+        downloadForm.style.display = 'none';
       });
     </script>
   </body>

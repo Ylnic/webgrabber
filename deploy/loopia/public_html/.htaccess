@@ -1,0 +1,5 @@
+Options -Indexes +ExecCGI
+AddHandler cgi-script .py
+DirectoryIndex index.py
+RewriteEngine On
+RewriteRule ^health/?$ index.py/health [L,QSA]

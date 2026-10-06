@@ -20,6 +20,7 @@ from webgrabber.crawler import (
     domain_folder_name,
     extract_base_domain,
 )
+from webgrabber.storage import DirectoryStorage
 
 
 class WebGrabberApp(tk.Tk):
@@ -46,17 +47,17 @@ class WebGrabberApp(tk.Tk):
         self.step_names = [
             "Målmapp",
             "Webbplats",
-            "Innehåll",
             "Begränsningar",
             "Genomsökning",
             "Förhandsgranskning",
+            "Innehåll",
             "Nedladdning",
         ]
 
         self.top_bar = ttk.Frame(self, padding=12)
         self.top_bar.pack(fill="x")
         ttk.Label(self.top_bar, text="WebGrabber", font=("SF Pro Display", 18, "bold")).pack(anchor="w")
-        self.step_label = ttk.Label(self.top_bar, text="Steg 1 av 6")
+        self.step_label = ttk.Label(self.top_bar, text="Steg 1 av 7")
         self.step_label.pack(anchor="w", pady=(6, 0))
 
         self.content = ttk.Frame(self, padding=(16, 8, 16, 20))
@@ -91,13 +92,13 @@ class WebGrabberApp(tk.Tk):
         elif self.current_step == 1:
             self.render_webbplats()
         elif self.current_step == 2:
-            self.render_innehåll()
-        elif self.current_step == 3:
             self.render_begränsningar()
-        elif self.current_step == 4:
+        elif self.current_step == 3:
             self.render_genomsökning()
-        elif self.current_step == 5:
+        elif self.current_step == 4:
             self.render_preview()
+        elif self.current_step == 5:
+            self.render_innehåll()
         else:
             self.render_downloading()
 
@@ -123,7 +124,7 @@ class WebGrabberApp(tk.Tk):
         self.mode_var = tk.StringVar(value=self.config["mode"])
         mode_frame = ttk.Frame(self.form_holder)
         mode_frame.pack(fill="x")
-        for label, value in (("Endast text", "text"), ("Text + filer", "text_files")):
+        for label, value in (("Hämta enbart text", "text"), ("Hämta allt innehåll", "text_files")):
             ttk.Radiobutton(mode_frame, text=label, variable=self.mode_var, value=value).pack(anchor="w", pady=4)
 
     def render_begränsningar(self):
@@ -213,21 +214,21 @@ class WebGrabberApp(tk.Tk):
             return
 
         page_count = len(self.preview_result.pages)
-        file_count = len(self.preview_result.files)
+        file_count = len(self.preview_result.linked_files)
         total_bytes = self.preview_result.estimated_bytes
         external = ", ".join(sorted(self.preview_result.external_domains)) or "Ingen"
         file_types = ", ".join(f"{k}: {v}" for k, v in self.preview_result.file_types.items()) or "Inga filer"
 
         summary = (
             f"Webbsidor: {page_count}\n"
-            f"Filer: {file_count}\n"
+            f"Länkade filer: {file_count}\n"
             f"Filtyper: {file_types}\n"
             f"Uppskattad datamängd: {total_bytes / (1024 * 1024):.2f} MB\n"
-            f"Externa domäner: {external}"
+            f"Upptäckta domäner/subdomäner ({len(self.preview_result.external_domains)}): {external}"
         )
         ttk.Label(self.form_holder, text=summary, justify="left", anchor="w").pack(anchor="w")
 
-        self.next_btn.config(text="Ladda ner")
+        self.next_btn.config(text="Välj innehåll")
 
     def choose_folder(self):
         folder = filedialog.askdirectory(title="Välj målmapp")
@@ -252,12 +253,6 @@ class WebGrabberApp(tk.Tk):
             return
 
         if self.current_step == 2:
-            self.config["mode"] = self.mode_var.get()
-            self.current_step += 1
-            self.render_step()
-            return
-
-        if self.current_step == 3:
             try:
                 max_pages = self._parse_optional_limit(
                     self.max_pages_var.get(), self.unlimited_pages_var.get()
@@ -282,7 +277,14 @@ class WebGrabberApp(tk.Tk):
             self.render_step()
             return
 
+        if self.current_step == 4:
+            self.current_step += 1
+            self.next_btn.config(text="Starta hämtning")
+            self.render_step()
+            return
+
         if self.current_step == 5:
+            self.config["mode"] = self.mode_var.get()
             self.download_material()
             return
 
@@ -298,14 +300,14 @@ class WebGrabberApp(tk.Tk):
             max_pages=self.config["max_pages"],
             max_depth=self.config["max_depth"],
             max_file_size_mb=self.config["max_file_size_mb"],
-            include_files=self.config["mode"] == "text_files",
+            include_files=False,
             include_text=True,
         )
         site_output_dir = self._site_output_dir()
         site_output_dir.mkdir(parents=True, exist_ok=True)
         self.crawler = SiteCrawler(
             self.config["start_url"],
-            str(site_output_dir),
+            DirectoryStorage(site_output_dir),
             settings,
             progress_callback=lambda count, queued, current_url: self.after(
                 0,
@@ -369,7 +371,7 @@ class WebGrabberApp(tk.Tk):
             self._show_preview()
 
     def _update_crawl_progress(self, page_count: int, queued_count: int, current_url: str):
-        if self.current_step != 4:
+        if self.current_step != 3:
             return
         if self.config["max_pages"] is None:
             maximum = max(1, page_count + queued_count)
@@ -513,7 +515,7 @@ class WebGrabberApp(tk.Tk):
         result = self.crawler.result
         output_dir = self._site_output_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
-        if not result.pages and not result.files:
+        if not result.pages and not result.linked_files:
             messagebox.showinfo("Inget att ladda ner", "Det fanns inget material att hämta.")
             try:
                 subprocess.Popen(["open", str(output_dir)])
@@ -537,6 +539,8 @@ class WebGrabberApp(tk.Tk):
         result = self.crawler.result
         output_dir = self._site_output_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
+        if self.config.get("mode", "text") == "text_files":
+            result = self.crawler.download_files()
         pages = sorted(result.pages)
         self.crawler.log_event(f"DOWNLOAD start pages={len(pages)} output={output_dir}")
         self.after(0, self._update_download_progress, 0, len(pages))
@@ -556,7 +560,7 @@ class WebGrabberApp(tk.Tk):
             self.after(0, self._update_download_progress, completed, len(pages))
 
         try:
-            build_index(result, str(output_dir))
+            DirectoryStorage(output_dir).write_json("index.json", build_index(result))
         except Exception as exc:
             self.after(0, self._download_failed, str(exc))
             return

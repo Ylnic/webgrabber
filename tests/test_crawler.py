@@ -13,6 +13,7 @@ from webgrabber.crawler import (
     normalize_url,
     should_visit,
 )
+from webgrabber.storage import DirectoryStorage
 
 
 def test_normalize_url_removes_trailing_slash_and_fragments():
@@ -45,7 +46,7 @@ def test_crawl_fetches_start_page(monkeypatch, tmp_path):
     )
     monkeypatch.setattr("webgrabber.crawler.requests.get", lambda *args, **kwargs: response)
 
-    crawler = SiteCrawler("https://example.se", str(tmp_path))
+    crawler = SiteCrawler("https://example.se", DirectoryStorage(tmp_path))
     monkeypatch.setattr(crawler, "_is_allowed_by_robots", lambda url: True)
 
     result = crawler.crawl()
@@ -59,6 +60,188 @@ def test_crawl_fetches_start_page(monkeypatch, tmp_path):
     assert "CRAWL slut status=complete sidor=1" in run_log
 
 
+def test_crawler_works_with_non_filesystem_storage():
+    class MemoryStorage:
+        def __init__(self):
+            self.pages = {}
+            self.events = []
+
+        def log_event(self, message):
+            self.events.append(message)
+
+        def store_page(self, url, html):
+            self.pages[url] = html
+
+        def store_file(self, url, content):
+            return url
+
+        def child(self, name):
+            return self
+
+    storage = MemoryStorage()
+    response = SimpleNamespace(
+        status_code=200,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+        content=b"<html><body>Memory page</body></html>",
+    )
+    crawler = SiteCrawler(
+        "https://example.se",
+        storage,
+        http_get=lambda *args, **kwargs: response,
+    )
+    crawler._is_allowed_by_robots = lambda url: True
+
+    result = crawler.crawl()
+
+    assert result.pages == {"https://example.se"}
+    assert storage.pages["https://example.se"].startswith("<html>")
+    assert storage.events
+
+
+def test_crawler_reports_runtime_limit_without_starting_requests(tmp_path):
+    crawler = SiteCrawler(
+        "https://example.se",
+        DirectoryStorage(tmp_path),
+        CrawlSettings(max_runtime_seconds=0),
+    )
+    crawler._is_allowed_by_robots = lambda url: pytest.fail("Request should not start")
+
+    result = crawler.crawl()
+
+    assert result.status == "time_limit"
+    assert result.limit_reason == "max_runtime_seconds"
+
+
+def test_crawler_stops_before_exceeding_total_byte_limit(monkeypatch, tmp_path):
+    response = SimpleNamespace(
+        status_code=200,
+        headers={
+            "Content-Type": "text/html; charset=utf-8",
+            "Content-Length": "10",
+        },
+        content=b"0123456789",
+    )
+    monkeypatch.setattr("webgrabber.crawler.requests.get", lambda *args, **kwargs: response)
+    crawler = SiteCrawler(
+        "https://example.se",
+        DirectoryStorage(tmp_path),
+        CrawlSettings(max_download_bytes=5),
+    )
+    crawler._is_allowed_by_robots = lambda url: True
+
+    result = crawler.crawl()
+
+    assert result.pages == set()
+    assert result.status == "limit_reached"
+    assert result.limit_reason == "max_total_bytes"
+
+
+def test_crawler_limits_file_count_before_reading_file_body(monkeypatch, tmp_path):
+    requested = []
+
+    def get_response(url, **kwargs):
+        requested.append(url)
+        if url == "https://example.se/":
+            return SimpleNamespace(
+                status_code=200,
+                headers={"Content-Type": "text/html; charset=utf-8"},
+                content=b'<a href="/document.pdf">PDF</a>',
+            )
+        return SimpleNamespace(
+            status_code=200,
+            headers={"Content-Type": "application/pdf", "Content-Length": "100"},
+            content=b"must not be read",
+            close=lambda: None,
+        )
+
+    monkeypatch.setattr("webgrabber.crawler.requests.get", get_response)
+    crawler = SiteCrawler(
+        "https://example.se/",
+        DirectoryStorage(tmp_path),
+        CrawlSettings(max_files=0, max_depth=1),
+    )
+    crawler._is_allowed_by_robots = lambda url: True
+
+    result = crawler.crawl()
+
+    assert requested == ["https://example.se/"]
+    assert result.files == set()
+    assert result.status == "limit_reached"
+    assert result.limit_reason == "max_files"
+
+
+def test_analysis_discovers_files_without_fetching_them(tmp_path):
+    requests_seen = []
+
+    def get_response(url, **kwargs):
+        requests_seen.append(url)
+        return SimpleNamespace(
+            status_code=200,
+            headers={"Content-Type": "text/html; charset=utf-8"},
+            content=b'<a href="/guide.pdf">Guide</a>',
+        )
+
+    crawler = SiteCrawler(
+        "https://example.se/",
+        DirectoryStorage(tmp_path),
+        CrawlSettings(include_files=False, max_depth=2),
+        http_get=get_response,
+    )
+    crawler._is_allowed_by_robots = lambda url: True
+
+    result = crawler.crawl()
+
+    assert requests_seen == ["https://example.se/"]
+    assert result.linked_files == {"https://example.se/guide.pdf"}
+    assert result.files == set()
+    assert result.file_types == {"pdf": 1}
+
+
+def test_analysis_caps_discovered_file_urls(tmp_path):
+    response = SimpleNamespace(
+        status_code=200,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+        content=b'<a href="/one.pdf">One</a><a href="/two.pdf">Two</a>',
+    )
+    crawler = SiteCrawler(
+        "https://example.se/",
+        DirectoryStorage(tmp_path),
+        CrawlSettings(include_files=False, max_files=1, max_depth=1),
+        http_get=lambda *args, **kwargs: response,
+    )
+    crawler._is_allowed_by_robots = lambda url: True
+
+    result = crawler.crawl()
+
+    assert result.linked_files == {"https://example.se/one.pdf"}
+    assert result.status == "limit_reached"
+    assert result.limit_reason == "max_files"
+
+
+def test_download_files_fetches_only_discovered_links(tmp_path):
+    response = SimpleNamespace(
+        status_code=200,
+        headers={"Content-Length": "4"},
+        iter_content=lambda chunk_size: iter((b"data",)),
+        close=lambda: None,
+    )
+    requests_seen = []
+    crawler = SiteCrawler(
+        "https://example.se/",
+        DirectoryStorage(tmp_path),
+        CrawlSettings(max_download_bytes=10, max_single_file_bytes=8),
+        http_get=lambda url, **kwargs: requests_seen.append(url) or response,
+    )
+    crawler.result.linked_files = {"https://example.se/guide.pdf"}
+    crawler._is_allowed_by_robots = lambda url: True
+
+    result = crawler.download_files()
+
+    assert requests_seen == ["https://example.se/guide.pdf"]
+    assert result.files == {"https://example.se/guide.pdf"}
+    assert (tmp_path / "files" / "guide.pdf").read_bytes() == b"data"
+
+
 def test_robots_request_has_timeout_and_honors_rules(monkeypatch, tmp_path):
     requests_seen = []
 
@@ -70,7 +253,7 @@ def test_robots_request_has_timeout_and_honors_rules(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr("webgrabber.crawler.requests.get", get_response)
-    crawler = SiteCrawler("https://example.se", str(tmp_path))
+    crawler = SiteCrawler("https://example.se", DirectoryStorage(tmp_path))
 
     assert crawler._is_allowed_by_robots("https://example.se/private") is False
     assert requests_seen[0][1]["timeout"] == (5, 10)
@@ -83,7 +266,7 @@ def test_robots_timeout_is_logged_and_does_not_hang(monkeypatch, tmp_path):
         raise requests.Timeout("robots request timed out")
 
     monkeypatch.setattr("webgrabber.crawler.requests.get", timeout)
-    crawler = SiteCrawler("https://example.se", str(tmp_path))
+    crawler = SiteCrawler("https://example.se", DirectoryStorage(tmp_path))
 
     assert crawler._is_allowed_by_robots("https://example.se/page") is True
     run_log = (tmp_path / "webgrabber.log").read_text(encoding="utf-8")
@@ -103,7 +286,7 @@ def test_crawl_respects_max_pages(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr("webgrabber.crawler.requests.get", get_response)
-    crawler = SiteCrawler("https://example.se", str(tmp_path), CrawlSettings(max_pages=1))
+    crawler = SiteCrawler("https://example.se", DirectoryStorage(tmp_path), CrawlSettings(max_pages=1))
     monkeypatch.setattr(crawler, "_is_allowed_by_robots", lambda url: True)
 
     result = crawler.crawl()
@@ -130,7 +313,7 @@ def test_crawl_allows_unlimited_pages(monkeypatch, tmp_path):
     monkeypatch.setattr("webgrabber.crawler.requests.get", get_response)
     crawler = SiteCrawler(
         "https://example.se",
-        str(tmp_path),
+        DirectoryStorage(tmp_path),
         CrawlSettings(max_pages=None, max_depth=1, max_file_size_mb=None),
     )
     monkeypatch.setattr(crawler, "_is_allowed_by_robots", lambda url: True)
@@ -151,7 +334,7 @@ def test_crawl_decodes_html_as_utf8_despite_conflicting_http_charset(monkeypatch
     )
     monkeypatch.setattr("webgrabber.crawler.requests.get", lambda *args, **kwargs: response)
 
-    crawler = SiteCrawler("https://example.se", str(tmp_path))
+    crawler = SiteCrawler("https://example.se", DirectoryStorage(tmp_path))
     monkeypatch.setattr(crawler, "_is_allowed_by_robots", lambda url: True)
 
     crawler.crawl()
@@ -197,7 +380,7 @@ def test_download_material_saves_html_as_utf8(monkeypatch, tmp_path):
     page_path.write_text(html, encoding="utf-8")
     app = SimpleNamespace(
         crawler=SimpleNamespace(result=result, log_event=log_messages.append),
-        config={"target_dir": str(tmp_path), "start_url": "https://www.example.se"},
+            config={"target_dir": str(tmp_path), "start_url": "https://www.example.se", "mode": "text"},
         _site_output_dir=lambda: tmp_path / "example.se",
         _domain_output_dir=lambda url: tmp_path / "example.se",
         _reset_wizard=lambda: reset.append(True),
@@ -254,6 +437,8 @@ def test_finish_step_keeps_app_open_for_next_crawl():
     closes = []
     app = SimpleNamespace(
         current_step=5,
+        mode_var=SimpleNamespace(get=lambda: "text"),
+        config={},
         download_material=lambda: downloads.append(True),
         destroy=lambda: closes.append(True),
     )
@@ -401,7 +586,7 @@ def test_start_crawl_uses_domain_output_directory(monkeypatch, tmp_path):
 
     WebGrabberApp.start_crawl(app)
 
-    assert crawler_args[0][0][1] == str(tmp_path / "example.se")
+    assert crawler_args[0][0][1].root == tmp_path / "example.se"
     assert callable(crawler_args[0][1]["progress_callback"])
 
 
@@ -425,7 +610,7 @@ def test_external_domain_crawl_uses_own_folder(monkeypatch, tmp_path):
     output_dir = tmp_path / "aftonbladet.se"
     crawler = SiteCrawler(
         "https://aftonbladet.se/",
-        str(output_dir),
+        DirectoryStorage(output_dir),
         CrawlSettings(max_pages=10, max_depth=1),
         progress_callback=lambda *values: progress.append(values),
     )
@@ -448,7 +633,7 @@ def test_external_domains_are_reported_when_main_page_limit_is_exhausted(monkeyp
     monkeypatch.setattr(SiteCrawler, "_is_allowed_by_robots", lambda self, url: True)
     crawler = SiteCrawler(
         "https://aftonbladet.se/",
-        str(tmp_path / "aftonbladet.se"),
+        DirectoryStorage(tmp_path / "aftonbladet.se"),
         CrawlSettings(max_pages=1, max_depth=1, max_file_size_mb=None),
     )
     crawler.result.pages.add("https://aftonbladet.se/")
@@ -484,7 +669,7 @@ def test_finish_crawl_asks_before_crawling_external_domains(monkeypatch):
     progress_updates = []
     app = SimpleNamespace(
         crawler=SimpleNamespace(result=result),
-        current_step=4,
+        current_step=3,
         status_var=SimpleNamespace(set=status_updates.append),
         progress_var=SimpleNamespace(set=progress_updates.append),
         _update_crawl_progress=lambda count, queued, current_url: None,
@@ -503,7 +688,7 @@ def test_update_crawl_progress_updates_count_queue_and_current_url():
     values = []
     messages = []
     app = SimpleNamespace(
-        current_step=4,
+        current_step=3,
         config={"max_pages": 10},
         progress=SimpleNamespace(configure=lambda **kwargs: values.append(kwargs)),
         progress_var=SimpleNamespace(set=messages.append),
@@ -519,7 +704,7 @@ def test_update_crawl_progress_is_determinate_when_pages_are_unlimited():
     values = []
     messages = []
     app = SimpleNamespace(
-        current_step=4,
+        current_step=3,
         config={"max_pages": None},
         progress=SimpleNamespace(configure=lambda **kwargs: values.append(kwargs)),
         progress_var=SimpleNamespace(set=messages.append),

@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import json
 import os
 import re
-import threading
-from datetime import datetime
+import time
 from collections import Counter, deque
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
@@ -15,8 +12,10 @@ from urllib.robotparser import RobotFileParser
 import requests
 from bs4 import BeautifulSoup
 
+from webgrabber.storage import CrawlStorage
+
 DEFAULT_HEADERS = {
-    "User-Agent": "WebGrabber/0.1 (+local-macOS-tool)"
+    "User-Agent": "WebGrabber/0.1 (+public-content-crawler)"
 }
 
 
@@ -64,9 +63,12 @@ FILE_TYPE_MAP = {
 @dataclass
 class CrawlSettings:
     max_pages: int | None = 200
+    max_files: int | None = None
     max_depth: int = 3
     max_file_size_mb: int | None = 50
     max_download_bytes: int | None = None
+    max_single_file_bytes: int | None = None
+    max_runtime_seconds: float | None = None
     include_files: bool = True
     include_text: bool = True
     allowed_file_extensions: tuple[str, ...] = (
@@ -106,13 +108,17 @@ class CrawlResult:
     start_url: str
     base_domain: str
     pages: set[str] = field(default_factory=set)
+    linked_pages: set[str] = field(default_factory=set)
     files: set[str] = field(default_factory=set)
+    linked_files: set[str] = field(default_factory=set)
     external_domains: set[str] = field(default_factory=set)
     external_pages: set[str] = field(default_factory=set)
     skipped_external_domains: set[str] = field(default_factory=set)
     file_types: Counter[str] = field(default_factory=Counter)
     estimated_bytes: int = 0
+    max_depth_reached: int = 0
     status: str = "ready"
+    limit_reason: str | None = None
 
 
 def normalize_url(url: str) -> str:
@@ -191,32 +197,27 @@ class SiteCrawler:
     def __init__(
         self,
         start_url: str,
-        output_dir: str,
+        storage: CrawlStorage,
         settings: CrawlSettings | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         additional_start_urls: Iterable[str] = (),
+        http_get: Callable[..., requests.Response] | None = None,
     ):
         self.start_url = normalize_url(start_url)
         self.base_domain = extract_base_domain(self.start_url)
-        self.output_dir = Path(output_dir)
+        self.storage = storage
         self.settings = settings or CrawlSettings()
         self.progress_callback = progress_callback
         self.additional_start_urls = tuple(additional_start_urls)
+        self.http_get = http_get or requests.get
+        self._deadline: float | None = None
         self.pause_event = False
         self.cancel_event = False
         self._status = "idle"
-        self._log_lock = threading.Lock()
         self.result = CrawlResult(start_url=self.start_url, base_domain=self.base_domain)
 
     def log_event(self, message: str) -> None:
-        try:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-            with self._log_lock:
-                with (self.output_dir / "webgrabber.log").open("a", encoding="utf-8") as log_file:
-                    log_file.write(f"{timestamp} {message}\n")
-        except OSError:
-            pass
+        self.storage.log_event(message)
 
     @property
     def status(self) -> str:
@@ -238,7 +239,11 @@ class SiteCrawler:
         robots_url = urljoin(urlsplit(url)._replace(path="/", query="", fragment="").geturl(), "/robots.txt")
         self.log_event(f"ROBOTS start url={robots_url}")
         try:
-            response = requests.get(robots_url, timeout=(5, 10), headers=DEFAULT_HEADERS)
+            response = self.http_get(
+                robots_url,
+                timeout=self._request_timeout((5, 10)),
+                headers=DEFAULT_HEADERS,
+            )
             self.log_event(f"ROBOTS svar status={response.status_code} url={robots_url}")
             if response.status_code >= 400:
                 return True
@@ -253,6 +258,21 @@ class SiteCrawler:
         except Exception as exc:
             self.log_event(f"ROBOTS fel url={robots_url} fel={exc!r}; fortsätter")
             return True
+
+    def _time_remaining(self) -> float | None:
+        if self._deadline is None:
+            return None
+        return self._deadline - time.monotonic()
+
+    def _request_timeout(self, defaults: tuple[float, float]) -> tuple[float, float]:
+        remaining = self._time_remaining()
+        if remaining is None:
+            return defaults
+        if remaining <= 0:
+            raise requests.Timeout("Crawl runtime limit reached")
+        connect_timeout = min(defaults[0], remaining * 0.4)
+        read_timeout = min(defaults[1], remaining - connect_timeout)
+        return connect_timeout, read_timeout
 
     def _extract_links(self, html: str, page_url: str) -> list[str]:
         soup = BeautifulSoup(html, "html.parser")
@@ -291,39 +311,29 @@ class SiteCrawler:
                     links.add(link)
         return links
 
-    def _store_page(self, url: str, html: str) -> None:
-        parsed = urlsplit(url)
-        relative_path = parsed.path.strip("/") or "index.html"
-        if not relative_path.endswith(".html"):
-            relative_path = f"{relative_path}.html" if relative_path != "index.html" else "index.html"
-        destination = self.output_dir / "pages" / relative_path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(html, encoding="utf-8", errors="replace")
-
-    def _store_file(self, url: str, content: bytes) -> str:
-        parsed = urlsplit(url)
-        relative_path = parsed.path.strip("/") or "download"
-        name = relative_path.rsplit("/", 1)[-1] or "download"
-        if not os.path.splitext(name)[1]:
-            ext = detect_file_type(url)
-            if ext != "unknown":
-                name = f"{name}.{ext}"
-                relative_path = f"{relative_path}.{ext}"
-        destination = self.output_dir / "files" / relative_path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(content)
-        return str(destination)
-
     def _read_response_content(
         self,
         response: requests.Response,
         remaining_bytes: int | None,
     ) -> bytes | None:
+        if self.settings.max_single_file_bytes is not None:
+            single_file_limit = self.settings.max_single_file_bytes
+            limit_reason = "max_single_file_bytes"
+            if remaining_bytes is not None and remaining_bytes <= single_file_limit:
+                limit_reason = "max_total_bytes"
+            remaining_bytes = (
+                single_file_limit
+                if remaining_bytes is None
+                else min(remaining_bytes, single_file_limit)
+            )
+        else:
+            limit_reason = "max_total_bytes"
         if remaining_bytes is not None:
             content_length = response.headers.get("Content-Length")
             if content_length:
                 try:
                     if int(content_length) > remaining_bytes:
+                        self.result.limit_reason = limit_reason
                         self.log_event(
                             f"SKIP body för stor content_length={content_length} kvar={remaining_bytes}"
                         )
@@ -339,9 +349,16 @@ class SiteCrawler:
         iter_content = getattr(response, "iter_content", None)
         chunks = iter_content(chunk_size=64 * 1024) if iter_content else (response.content,)
         for chunk in chunks:
+            if self._time_remaining() is not None and self._time_remaining() <= 0:
+                self.result.limit_reason = "max_runtime_seconds"
+                close = getattr(response, "close", None)
+                if close is not None:
+                    close()
+                return None
             if not chunk:
                 continue
             if remaining_bytes is not None and len(content) + len(chunk) > remaining_bytes:
+                self.result.limit_reason = limit_reason
                 close = getattr(response, "close", None)
                 if close is not None:
                     close()
@@ -353,6 +370,11 @@ class SiteCrawler:
         return bytes(content)
 
     def crawl(self) -> CrawlResult:
+        self._deadline = (
+            None
+            if self.settings.max_runtime_seconds is None
+            else time.monotonic() + self.settings.max_runtime_seconds
+        )
         self._status = "running"
         self.cancel_event = False
         self.pause_event = False
@@ -373,12 +395,16 @@ class SiteCrawler:
         )
 
         while queue and not self.cancel_event:
+            if self._time_remaining() is not None and self._time_remaining() <= 0:
+                break
+            if max_bytes is not None and self.result.estimated_bytes >= max_bytes:
+                self.result.limit_reason = "max_total_bytes"
+                break
             if self.settings.max_pages is not None and pending_pages >= self.settings.max_pages:
                 break
             while self.pause_event:
                 if self.cancel_event:
                     return self.result
-                import time
                 time.sleep(0.2)
 
             url, depth = queue.popleft()
@@ -397,7 +423,12 @@ class SiteCrawler:
 
             try:
                 self.log_event(f"GET start url={normalized}")
-                response = requests.get(normalized, timeout=(5, 15), headers=DEFAULT_HEADERS, stream=True)
+                response = self.http_get(
+                    normalized,
+                    timeout=self._request_timeout((5, 15)),
+                    headers=DEFAULT_HEADERS,
+                    stream=True,
+                )
                 if response.status_code >= 400:
                     self.log_event(f"GET fel status={response.status_code} url={normalized}")
                     close = getattr(response, "close", None)
@@ -415,6 +446,19 @@ class SiteCrawler:
             is_html = response.headers.get("Content-Type", "").startswith("text/html") or normalized.endswith((".html", ".htm", "/"))
             detected_type = detect_file_type(normalized)
             should_store_file = self.settings.include_files and detected_type != "unknown"
+            if (
+                should_store_file
+                and not is_html
+                and normalized not in discovered_files
+                and self.settings.max_files is not None
+                and len(discovered_files) >= self.settings.max_files
+            ):
+                self.result.limit_reason = "max_files"
+                self.log_event(f"SKIP antal_filer url={normalized}")
+                close = getattr(response, "close", None)
+                if close is not None:
+                    close()
+                continue
             if not is_html and not should_store_file:
                 self.log_event(f"SKIP filtyp url={normalized}")
                 close = getattr(response, "close", None)
@@ -446,21 +490,37 @@ class SiteCrawler:
                     continue
                 discovered_pages.add(normalized)
                 self.result.pages = discovered_pages
+                self.result.max_depth_reached = max(self.result.max_depth_reached, depth)
                 pending_pages += 1
                 if self.progress_callback is not None:
                     self.progress_callback(pending_pages, len(queue), "")
                 self.result.status = f"crawling: {pending_pages}"
                 html = content.decode("utf-8", errors="replace")
                 try:
-                    self._store_page(normalized, html)
+                    self.storage.store_page(normalized, html)
                     self.log_event(f"PAGE sparad sida={pending_pages} url={normalized}")
                 except Exception as exc:
                     self.log_event(f"PAGE skrivfel url={normalized} fel={exc!r}")
 
                 for link in self._extract_links(html, normalized):
                     if should_visit(link, self.start_url, normalized):
-                        if link not in discovered_pages and link not in queue:
-                            queue.append((link, depth + 1))
+                        detected_file_type = detect_file_type(link)
+                        if detected_file_type in self.settings.allowed_file_extensions:
+                            if link not in self.result.linked_files:
+                                if (
+                                    self.settings.max_files is not None
+                                    and len(self.result.linked_files) >= self.settings.max_files
+                                ):
+                                    self.result.limit_reason = "max_files"
+                                    continue
+                                self.result.linked_files.add(link)
+                                file_types[detected_file_type] += 1
+                            if self.settings.include_files and link not in discovered_pages and link not in queue:
+                                queue.append((link, depth + 1))
+                        else:
+                            self.result.linked_pages.add(link)
+                            if link not in discovered_pages and link not in queue:
+                                queue.append((link, depth + 1))
                     else:
                         candidate_host = urlsplit(link).netloc.split(":", 1)[0].lower().removeprefix("www.")
                         if candidate_host and candidate_host != self.base_domain:
@@ -478,25 +538,90 @@ class SiteCrawler:
             if should_store_file:
                 if normalized not in discovered_files:
                     discovered_files.add(normalized)
-                    file_types[detected_type] += 1
                     self.result.files = discovered_files
                     self.result.file_types = file_types
                     self.result.external_domains = external_domains
-                self._store_file(normalized, content)
+                self.storage.store_file(normalized, content)
                 self.log_event(f"FILE sparad fil={normalized} bytes={len(content)}")
 
         if self.progress_callback is not None:
             self.progress_callback(pending_pages, len(queue), "")
         self.result.pages = discovered_pages
         self.result.files = discovered_files
+        self.result.linked_files.update(
+            link for link in discovered_files if link not in self.result.linked_files
+        )
         self.result.file_types = file_types
         self.result.external_domains = external_domains
-        self.result.status = "complete" if not self.cancel_event else "cancelled"
+        if self.cancel_event:
+            self.result.status = "cancelled"
+        elif self._time_remaining() is not None and self._time_remaining() <= 0:
+            self.result.status = "time_limit"
+            self.result.limit_reason = "max_runtime_seconds"
+        elif self.result.limit_reason is not None:
+            self.result.status = "limit_reached"
+        else:
+            self.result.status = "complete"
         self._status = self.result.status
         self.log_event(
             f"CRAWL slut status={self.result.status} sidor={len(discovered_pages)} "
             f"filer={len(discovered_files)} bytes={self.result.estimated_bytes} kvar_i_kö={len(queue)}"
         )
+        return self.result
+
+    def download_files(self, file_urls: Iterable[str] | None = None) -> CrawlResult:
+        self._deadline = (
+            None
+            if self.settings.max_runtime_seconds is None
+            else time.monotonic() + self.settings.max_runtime_seconds
+        )
+        urls = sorted(file_urls if file_urls is not None else self.result.linked_files)
+        total_limit = self.settings.max_download_bytes
+        if total_limit is None and self.settings.max_file_size_mb is not None:
+            total_limit = self.settings.max_file_size_mb * 1024 * 1024
+
+        for url in urls:
+            if self._time_remaining() is not None and self._time_remaining() <= 0:
+                self.result.status = "time_limit"
+                self.result.limit_reason = "max_runtime_seconds"
+                break
+            if self.settings.max_files is not None and len(self.result.files) >= self.settings.max_files:
+                self.result.status = "limit_reached"
+                self.result.limit_reason = "max_files"
+                break
+            if total_limit is not None and self.result.estimated_bytes >= total_limit:
+                self.result.status = "limit_reached"
+                self.result.limit_reason = "max_total_bytes"
+                break
+            if url in self.result.files or not self._is_allowed_by_robots(url):
+                continue
+            response = None
+            try:
+                response = self.http_get(
+                    url,
+                    timeout=self._request_timeout((5, 15)),
+                    headers=DEFAULT_HEADERS,
+                    stream=True,
+                )
+                if response.status_code >= 400:
+                    continue
+                remaining_bytes = None if total_limit is None else total_limit - self.result.estimated_bytes
+                content = self._read_response_content(response, remaining_bytes)
+                if content is None:
+                    continue
+                self.storage.store_file(url, content)
+                self.result.files.add(url)
+                self.result.estimated_bytes += len(content)
+            except requests.RequestException as exc:
+                self.log_event(f"FILE nätverksfel url={url} fel={exc!r}")
+            finally:
+                close = getattr(response, "close", None)
+                if close is not None:
+                    close()
+
+        if self.result.status not in {"time_limit", "limit_reached"}:
+            self.result.status = "complete"
+        self._status = self.result.status
         return self.result
 
     def crawl_external_domains(self) -> None:
@@ -537,16 +662,15 @@ class SiteCrawler:
             if not seeds:
                 continue
 
-            domain_output_dir = self.output_dir / domain_folder_name(domain)
-            domain_output_dir.mkdir(parents=True, exist_ok=True)
+            domain_storage = self.storage.child(domain_folder_name(domain))
             self.log_event(
-                f"EXTERNAL domain_start domain={domain} seeds={len(seeds)} output={domain_output_dir}"
+                f"EXTERNAL domain_start domain={domain} seeds={len(seeds)}"
             )
 
             progress_offset = len(self.result.pages)
             child = SiteCrawler(
                 seeds[0],
-                str(domain_output_dir),
+                domain_storage,
                 replace(
                     self.settings,
                     max_pages=remaining_pages,
@@ -565,6 +689,7 @@ class SiteCrawler:
             child.crawl()
             self.result.pages.update(child.result.pages)
             self.result.files.update(child.result.files)
+            self.result.linked_files.update(child.result.linked_files)
             self.result.file_types.update(child.result.file_types)
             self.result.estimated_bytes += child.result.estimated_bytes
             if remaining_pages is not None:
@@ -584,12 +709,16 @@ class SiteCrawler:
         )
 
 
-def build_index(result: CrawlResult, output_dir: str) -> dict:
-    index = {
+def build_index(result: CrawlResult) -> dict:
+    return {
         "start_url": result.start_url,
         "base_domain": result.base_domain,
         "page_count": len(result.pages),
-        "file_count": len(result.files),
+        "linked_page_count": len(result.linked_pages),
+        "linked_pages": sorted(result.linked_pages),
+        "max_depth_reached": result.max_depth_reached,
+        "file_count": len(result.linked_files),
+        "downloaded_file_count": len(result.files),
         "file_types": dict(result.file_types),
         "external_domains": sorted(result.external_domains),
         "external_pages": sorted(result.external_pages),
@@ -597,8 +726,7 @@ def build_index(result: CrawlResult, output_dir: str) -> dict:
         "estimated_bytes": result.estimated_bytes,
         "pages": sorted(result.pages),
         "files": sorted(result.files),
+        "linked_files": sorted(result.linked_files),
         "status": result.status,
+        "limit_reason": result.limit_reason,
     }
-    output_path = Path(output_dir) / "index.json"
-    output_path.write_text(json.dumps(index, indent=2), encoding="utf-8")
-    return index
