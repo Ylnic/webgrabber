@@ -22,8 +22,8 @@ from webgrabber.safe_http import SafeHTTPClient
 from webgrabber.storage import DirectoryStorage
 
 MAX_REQUEST_BYTES = 8192
-MAX_PAGES = 50
-MAX_FILES = 50
+MAX_PAGES = 200
+MAX_FILES = 200
 MAX_DEPTH = 5
 MAX_SINGLE_FILE_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_BYTES = 5 * 1024 * 1024
@@ -150,7 +150,8 @@ input,select,button{{width:100%;font:inherit;border:1px solid #c6d3da;border-rad
 <form method="post" action="/">
 <input type="hidden" name="action" value="analyze">
 <label for="start_url">Webbplats</label><input id="start_url" name="start_url" type="url" placeholder="https://example.se" maxlength="2048" required>
-<p>Webbplatsen analyseras först (upp till {MAX_PAGES} sidor och djup {MAX_DEPTH}). Därefter väljer du omfattning och innehåll.</p>
+<p>Webbplatsen analyseras först (upp till {MAX_PAGES} sidor och djup {MAX_DEPTH}). Därefter väljer du omfattning och innehåll. Du kan hämta upp till {MAX_FILES} länkade filer.</p>
+<p>Analys och hämtning har vardera en gräns på {MAX_RUNTIME_SECONDS:g} sekunder och {MAX_TOTAL_BYTES // (1024 * 1024)} MiB data. Den faktiska mängden kan därför bli lägre än valt sid- och filantal.</p>
 <button type="submit">Analysera webbplats</button></form></section></main></body></html>"""
     return page.encode("utf-8")
 

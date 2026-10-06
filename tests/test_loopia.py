@@ -30,6 +30,9 @@ def test_homepage_is_served_without_starting_crawler(tmp_path):
     assert status == 200
     assert headers["Content-Type"].startswith("text/html")
     assert b"WebGrabber" in body
+    assert b"upp till 200 sidor" in body
+    assert b"200 l\xc3\xa4nkade filer" in body
+    assert b"12 sekunder" in body
 
 
 def test_post_rejects_private_ip_before_creating_job(tmp_path):
@@ -102,7 +105,7 @@ def test_analysis_previews_then_returns_selected_zip(tmp_path, monkeypatch, mode
     assert headers["Content-Type"].startswith("text/html")
     assert "Hämta enbart text".encode() in preview
     assert "Hämta allt innehåll".encode() in preview
-    assert b"L\xc3\xa4nkade filer (max 50)</dt><dd>1</dd>" in preview
+    assert b"L\xc3\xa4nkade filer (max 200)</dt><dd>1</dd>" in preview
     assert b"Interna sidl\xc3\xa4nkar</dt><dd>1</dd>" in preview
     assert b"Maxdjup (0\xe2\x80\x935)" in preview
     job_id = re.search(rb'name="job_id" value="([A-Za-z0-9_-]{32})"', preview).group(1).decode()
@@ -110,7 +113,7 @@ def test_analysis_previews_then_returns_selected_zip(tmp_path, monkeypatch, mode
     assert job_dir.is_dir()
 
     download_body = (
-        f"action=download&job_id={job_id}&mode={mode}&max_pages=2&max_depth=1".encode()
+        f"action=download&job_id={job_id}&mode={mode}&max_pages=200&max_depth=5".encode()
     )
     status, headers, archive_bytes = handle_request(
         "POST",

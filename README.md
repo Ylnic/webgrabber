@@ -91,7 +91,7 @@ sh deploy/loopia/build_deploy.sh
 
 The ZIP is written to `deploy/loopia/dist/webgrabber-loopia.zip`. Extract it locally and upload its `public_html/`, `app/`, and `private/` directories as siblings using FTPS. Set the subdomain document root to `public_html`, keep `app` and `private` outside it, and set `public_html/index.py` to **CHMOD 755**. The CGI script uses `/usr/local/bin/python3`; Python dependencies are vendored into `app/vendor` by the build script.
 
-After upload, verify `https://webgrabber.ylnic.se/health` before submitting a crawl. Loopia uses two bounded CGI requests: one to analyze and preview the site, then one to crawl the selected page/depth range and create the ZIP. The analysis and selected crawl are each limited to 12 seconds and 5 MiB of response data; Loopia allows up to 50 pages, 50 linked files, depth 5, 2 MiB per response, and a 6 MiB ZIP. An analysis can be incomplete if a time or data limit is reached. See `deploy/loopia/README.md` for cleanup and CGI timeout details.
+After upload, verify `https://webgrabber.ylnic.se/health` before submitting a crawl. Loopia uses two bounded CGI requests: one to analyze and preview the site, then one to crawl the selected page/depth range and create the ZIP. The analysis and selected crawl are each limited to 12 seconds and 5 MiB of response data; the current application limits are 200 pages, 200 linked files, depth 5, 2 MiB per response, and a 6 MiB ZIP. Actual results can be smaller when a time or data limit is reached. See `deploy/loopia/README.md` for cleanup and CGI timeout details.
 
 ## Build a macOS installer
 
