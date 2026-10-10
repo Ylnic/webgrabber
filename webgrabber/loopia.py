@@ -150,8 +150,8 @@ input,select,button{{width:100%;font:inherit;border:1px solid #c6d3da;border-rad
 <form method="post" action="/">
 <input type="hidden" name="action" value="analyze">
 <label for="start_url">Webbplats</label><input id="start_url" name="start_url" type="url" placeholder="https://example.se" maxlength="2048" required>
-<p>Webbplatsen analyseras först (upp till {MAX_PAGES} sidor och djup {MAX_DEPTH}). Därefter väljer du omfattning och innehåll. Du kan hämta upp till {MAX_FILES} länkade filer.</p>
-<p>Analys och hämtning har vardera en gräns på {MAX_RUNTIME_SECONDS:g} sekunder och {MAX_TOTAL_BYTES // (1024 * 1024)} MiB data. Den faktiska mängden kan därför bli lägre än valt sid- och filantal.</p>
+<p>Ange bara webbplatsen. Nästa steg analyserar webbplatsen och länkar till externa domäner, och visar sidor och filer som hittas.</p>
+<p>Analysen är begränsad till {MAX_PAGES} sidor, {MAX_FILES} filer, djup {MAX_DEPTH}, {MAX_RUNTIME_SECONDS:g} sekunder och {MAX_TOTAL_BYTES // (1024 * 1024)} MiB data.</p>
 <button type="submit">Analysera webbplats</button></form></section></main></body></html>"""
     return page.encode("utf-8")
 
@@ -162,6 +162,22 @@ def _render_preview(job_id: str, result: CrawlResult) -> bytes:
     domain_items = "".join(
         f"<li>{html.escape(domain)}</li>" for domain in sorted(result.external_domains)
     ) or "<li>Inga externa domäner eller subdomäner hittades</li>"
+    page_items = "".join(
+        f"<li><code>{html.escape(url)}</code></li>" for url in sorted(result.pages)
+    ) or "<li>Inga sidor hämtades</li>"
+    linked_page_items = "".join(
+        f"<li><code>{html.escape(url)}</code></li>" for url in sorted(result.linked_pages)
+    ) or "<li>Inga ytterligare interna sidlänkar hittades</li>"
+    external_page_items = "".join(
+        f"<li><code>{html.escape(url)}</code></li>" for url in sorted(result.external_pages)
+    ) or "<li>Inga externa sidlänkar hittades</li>"
+    external_file_items = "".join(
+        f"<li><code>{html.escape(url)}</code></li>" for url in sorted(result.external_files)
+    ) or "<li>Inga externa filer hittades</li>"
+    file_items = "".join(
+        f"<li><code>{html.escape(url)}</code></li>"
+        for url in sorted(result.linked_files | result.external_files)
+    ) or "<li>Inga filer hittades</li>"
     file_types = ", ".join(
         f"{html.escape(file_type)}: {count}"
         for file_type, count in sorted(result.file_types.items())
@@ -179,16 +195,21 @@ def _render_preview(job_id: str, result: CrawlResult) -> bytes:
 main{{max-width:760px;margin:7vh auto;padding:24px}}section{{background:#fff;border:1px solid #d6e0e5;border-radius:8px;padding:28px;box-shadow:0 14px 36px #142a3612}}
 h1{{font-size:28px;margin:0 0 8px}}p{{color:#526570;line-height:1.5}}dl{{display:grid;grid-template-columns:1fr auto;gap:12px;border-top:1px solid #d6e0e5;padding-top:12px}}dt{{color:#526570}}dd{{margin:0;font-weight:700}}ul{{padding-left:22px;line-height:1.7}}
 fieldset{{border:0;padding:0;margin:22px 0 0}}legend{{font-weight:700;margin-bottom:10px}}label{{display:flex;gap:10px;align-items:center;padding:10px 0}}input[type=radio]{{width:18px;height:18px;accent-color:#146f67}}
-button{{width:100%;padding:12px;border:0;border-radius:5px;background:#146f67;color:white;font:inherit;font-weight:700;cursor:pointer}}.notice{{padding:10px;background:#fff2dd;border-left:3px solid #ba6c00;color:#533400}}
+button{{width:100%;padding:12px;border:0;border-radius:5px;background:#146f67;color:white;font:inherit;font-weight:700;cursor:pointer}}.notice{{padding:10px;background:#fff2dd;border-left:3px solid #ba6c00;color:#533400}}details{{margin:12px 0;border-top:1px solid #d6e0e5;padding-top:12px}}summary{{font-weight:700;cursor:pointer}}code{{overflow-wrap:anywhere}}
 a{{display:inline-block;margin-top:18px;color:#146f67}}@media(max-width:600px){{main{{margin:0 auto;padding:12px}}section{{padding:20px}}}}
 </style></head><body><main><section><h1>Analysresultat</h1>
-<p>Granska webbplatsen innan du väljer vad som ska hämtas.</p>{limit_note}
+<p>Granska hittade sidor och filer innan du väljer vad som ska hämtas. Externa domäner genomsöks också, inom gränserna ovan.</p>{limit_note}
 <dl><dt>Webbsidor hittade</dt><dd>{len(result.pages)}</dd><dt>Djup som analyserats</dt><dd>{result.max_depth_reached}</dd>
-<dt>Interna sidlänkar</dt><dd>{len(result.linked_pages)}</dd><dt>Länkade filer (max {MAX_FILES})</dt><dd>{len(result.linked_files)}</dd>
+<dt>Interna sidlänkar</dt><dd>{len(result.linked_pages)}</dd><dt>Länkade filer (max {MAX_FILES})</dt><dd>{len(result.linked_files | result.external_files)}</dd>
 <dt>Filtyper</dt><dd>{file_types}</dd><dt>Analyserad datamängd</dt><dd>{result.estimated_bytes / (1024 * 1024):.2f} MB</dd>
 <dt>Upptäckta domäner/subdomäner</dt><dd>{len(result.external_domains)}</dd>
 <dt>Analysstatus</dt><dd>{html.escape(result.status)}</dd></dl>
 <h2>Externa domäner och subdomäner</h2><ul>{domain_items}</ul>
+<details><summary>Analyserade sidor ({len(result.pages)})</summary><ul>{page_items}</ul></details>
+<details><summary>Interna sidlänkar ({len(result.linked_pages)})</summary><ul>{linked_page_items}</ul></details>
+<details><summary>Externa sidlänkar ({len(result.external_pages)})</summary><ul>{external_page_items}</ul></details>
+<details><summary>Hittade filer ({len(result.linked_files | result.external_files)})</summary><ul>{file_items}</ul></details>
+<details><summary>Filer länkade från externa domäner ({len(result.external_files)})</summary><ul>{external_file_items}</ul></details>
 <form method="post" action="/"><input type="hidden" name="action" value="download">
 <input type="hidden" name="job_id" value="{html.escape(job_id, quote=True)}">
 <div class="grid"><div><label for="max_pages">Hämta högst antal sidor (1–{MAX_PAGES})</label>
@@ -229,6 +250,7 @@ def _serialize_result(result: CrawlResult) -> dict[str, Any]:
         "max_depth_reached": result.max_depth_reached,
         "files": sorted(result.files),
         "linked_files": sorted(result.linked_files),
+        "external_files": sorted(result.external_files),
         "external_domains": sorted(result.external_domains),
         "external_pages": sorted(result.external_pages),
         "skipped_external_domains": sorted(result.skipped_external_domains),
@@ -246,6 +268,7 @@ def _deserialize_result(value: dict[str, Any]) -> CrawlResult:
     result.max_depth_reached = int(value.get("max_depth_reached", 0))
     result.files = set(value.get("files", []))
     result.linked_files = set(value.get("linked_files", []))
+    result.external_files = set(value.get("external_files", []))
     result.external_domains = set(value.get("external_domains", []))
     result.external_pages = set(value.get("external_pages", []))
     result.skipped_external_domains = set(value.get("skipped_external_domains", []))
@@ -302,6 +325,7 @@ def _run_analysis(payload: dict[str, Any], storage_root: Path, remote_addr: str)
             http_get=SafeHTTPClient().get,
         )
         result = crawler.crawl()
+        crawler.crawl_external_domains()
         (job_dir / "analysis.json").write_text(
             json.dumps(
                 {
@@ -363,6 +387,7 @@ def _run_download(payload: dict[str, Any], storage_root: Path, remote_addr: str)
             http_get=SafeHTTPClient().get,
         )
         result = crawler.crawl()
+        crawler.crawl_external_domains()
         if mode == "all":
             result = crawler.download_files()
         archive = _create_archive(job_id, result, output_dir)

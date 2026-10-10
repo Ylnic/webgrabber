@@ -60,7 +60,7 @@ This checks that CGI ran, Python dependencies imported, and the private storage 
 
 ## CGI limits
 
-CGI cannot keep a crawl running after its HTTP request ends. The web flow uses two bounded requests: the first analyzes pages and links and saves a private preview; the second crawls the selected page/depth range and creates the ZIP. Analysis state is stored outside the document root for up to one hour. No resident worker, polling loop, or resumed process is required.
+CGI cannot keep a crawl running after its HTTP request ends. The web flow uses two bounded requests: the first analyzes pages and follows linked external domains before saving a private preview; the second repeats that crawl for the selected page/depth range and creates the ZIP. Both steps discover linked files on the main and external domains. Analysis state is stored outside the document root for up to one hour. No resident worker, polling loop, or resumed process is required.
 
 Hard application limits are 12 seconds per request, at most 200 pages, 200 discovered/downloaded files, depth 5, 2 MiB per response, 5 MiB of response data per request, and a 6 MiB ZIP. The selected page/file counts are upper bounds: the runtime and data limits can stop either the analysis or download sooner. DNS lookup is bounded to 1 second per validation, connection timeouts are capped at 2 seconds, and socket read timeouts are capped at 1 second. The service allows one active crawl at a time and limits each client address to 6 requests per hour (up to 3 analyze-and-download runs). A limited analysis or file download is reported in the preview or ZIP manifest with its status and limit reason.
 

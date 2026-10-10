@@ -41,7 +41,7 @@ You can also double-click `start_webgrabber.command`. It creates `.venv` if need
 
 ## Hosted web setup on a subdomain
 
-The repository contains two separate web deployment targets: an optional Flask app for Python application hosts, and a CGI package for Loopia UNIX. The Loopia package does not use Flask or require a permanent server process. Both web versions analyze first, show page count, crawl depth, internal page links, linked files, file types and discovered domains/subdomains, then let you choose the page/depth limits and whether to fetch **enbart text** or **allt innehåll** before ZIP generation.
+The repository contains two separate web deployment targets: an optional Flask app for Python application hosts, and a CGI package for Loopia UNIX. The Loopia package does not use Flask or require a permanent server process. Both web versions first ask only for the website address and analyze the site before offering download options. The Loopia analysis also follows linked external domains and previews the pages, files, file types and domains found. Analysis is bounded by the configured page, depth, file, byte and runtime limits; it cannot discover URLs that are not linked from scanned pages.
 
 ### 1. Configure the domain
 
@@ -91,7 +91,7 @@ sh deploy/loopia/build_deploy.sh
 
 The ZIP is written to `deploy/loopia/dist/webgrabber-loopia.zip`. Extract it locally and upload its `public_html/`, `app/`, and `private/` directories as siblings using FTPS. Set the subdomain document root to `public_html`, keep `app` and `private` outside it, and set `public_html/index.py` to **CHMOD 755**. The CGI script uses `/usr/local/bin/python3`; Python dependencies are vendored into `app/vendor` by the build script.
 
-After upload, verify `https://webgrabber.ylnic.se/health` before submitting a crawl. Loopia uses two bounded CGI requests: one to analyze and preview the site, then one to crawl the selected page/depth range and create the ZIP. The analysis and selected crawl are each limited to 12 seconds and 5 MiB of response data; the current application limits are 200 pages, 200 linked files, depth 5, 2 MiB per response, and a 6 MiB ZIP. Actual results can be smaller when a time or data limit is reached. See `deploy/loopia/README.md` for cleanup and CGI timeout details.
+After upload, verify `https://webgrabber.ylnic.se/health` before submitting a crawl. Loopia uses two bounded CGI requests: one to analyze and preview the site, then one to crawl the selected page/depth range and create the ZIP. Both requests follow linked external domains and include eligible linked files in the preview. The analysis and selected crawl are each limited to 12 seconds and 5 MiB of response data; the current application limits are 200 pages, 200 linked files, depth 5, 2 MiB per response, and a 6 MiB ZIP. Actual results can be smaller when a time or data limit is reached. See `deploy/loopia/README.md` for cleanup and CGI timeout details.
 
 ## Build a macOS installer
 

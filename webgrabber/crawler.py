@@ -111,6 +111,7 @@ class CrawlResult:
     linked_pages: set[str] = field(default_factory=set)
     files: set[str] = field(default_factory=set)
     linked_files: set[str] = field(default_factory=set)
+    external_files: set[str] = field(default_factory=set)
     external_domains: set[str] = field(default_factory=set)
     external_pages: set[str] = field(default_factory=set)
     skipped_external_domains: set[str] = field(default_factory=set)
@@ -305,6 +306,8 @@ class SiteCrawler:
                 continue
             if urlsplit(link).scheme not in {"http", "https"}:
                 continue
+            if detect_file_type(link) in self.settings.allowed_file_extensions:
+                continue
             if not should_visit(link, self.start_url):
                 host = extract_base_domain(link)
                 if host and host != self.base_domain:
@@ -370,11 +373,8 @@ class SiteCrawler:
         return bytes(content)
 
     def crawl(self) -> CrawlResult:
-        self._deadline = (
-            None
-            if self.settings.max_runtime_seconds is None
-            else time.monotonic() + self.settings.max_runtime_seconds
-        )
+        if self._deadline is None and self.settings.max_runtime_seconds is not None:
+            self._deadline = time.monotonic() + self.settings.max_runtime_seconds
         self._status = "running"
         self.cancel_event = False
         self.pause_event = False
@@ -525,6 +525,23 @@ class SiteCrawler:
                         candidate_host = urlsplit(link).netloc.split(":", 1)[0].lower().removeprefix("www.")
                         if candidate_host and candidate_host != self.base_domain:
                             external_domains.add(candidate_host)
+                            detected_file_type = detect_file_type(link)
+                            if detected_file_type in self.settings.allowed_file_extensions:
+                                discovered_file_urls = (
+                                    self.result.linked_files
+                                    | self.result.external_files
+                                    | discovered_files
+                                )
+                                if link in discovered_file_urls:
+                                    continue
+                                if (
+                                    self.settings.max_files is not None
+                                    and len(discovered_file_urls) >= self.settings.max_files
+                                ):
+                                    self.result.limit_reason = "max_files"
+                                    continue
+                                self.result.external_files.add(link)
+                                file_types[detected_file_type] += 1
                 external_pages.update(self._extract_external_page_links(html, normalized))
                 self.result.external_pages = external_pages
                 self.result.external_domains = external_domains
@@ -570,12 +587,13 @@ class SiteCrawler:
         return self.result
 
     def download_files(self, file_urls: Iterable[str] | None = None) -> CrawlResult:
-        self._deadline = (
-            None
-            if self.settings.max_runtime_seconds is None
-            else time.monotonic() + self.settings.max_runtime_seconds
+        if self._deadline is None and self.settings.max_runtime_seconds is not None:
+            self._deadline = time.monotonic() + self.settings.max_runtime_seconds
+        urls = sorted(
+            file_urls
+            if file_urls is not None
+            else self.result.linked_files | self.result.external_files
         )
-        urls = sorted(file_urls if file_urls is not None else self.result.linked_files)
         total_limit = self.settings.max_download_bytes
         if total_limit is None and self.settings.max_file_size_mb is not None:
             total_limit = self.settings.max_file_size_mb * 1024 * 1024
@@ -639,29 +657,56 @@ class SiteCrawler:
             if total_limit is None
             else max(0, total_limit - self.result.estimated_bytes)
         )
-        external_domains = sorted({extract_base_domain(url) for url in self.result.external_pages})
+        remaining_files = (
+            None
+            if self.settings.max_files is None
+            else max(
+                0,
+                self.settings.max_files
+                - len(self.result.linked_files | self.result.external_files | self.result.files),
+            )
+        )
+        visited_domains = {self.base_domain}
         self.log_event(
-            f"EXTERNAL start domains={','.join(external_domains)} "
+            f"EXTERNAL start domains={len(self.result.external_pages)} "
             f"remaining_pages={remaining_pages} remaining_bytes={remaining_bytes}"
         )
-        for index, domain in enumerate(external_domains):
+        while True:
+            external_domains = sorted(
+                {
+                    extract_base_domain(url)
+                    for url in self.result.external_pages
+                    if extract_base_domain(url) not in visited_domains
+                }
+            )
+            if not external_domains:
+                break
+            domain = external_domains[0]
             if self.cancel_event:
                 break
+            if self._time_remaining() is not None and self._time_remaining() <= 0:
+                self.result.limit_reason = "max_runtime_seconds"
+                self.result.skipped_external_domains.update(external_domains)
+                break
             if remaining_pages is not None and remaining_pages <= 0:
-                self.result.skipped_external_domains.update(external_domains[index:])
-                self.log_event(f"EXTERNAL skip domains={','.join(external_domains[index:])} reason=max_pages")
+                self.result.limit_reason = "max_pages"
+                self.result.skipped_external_domains.update(external_domains)
+                self.log_event(f"EXTERNAL skip domains={','.join(external_domains)} reason=max_pages")
                 break
             if remaining_bytes is not None and remaining_bytes <= 0:
-                self.result.skipped_external_domains.update(external_domains[index:])
-                self.log_event(f"EXTERNAL skip domains={','.join(external_domains[index:])} reason=max_bytes")
+                self.result.limit_reason = "max_total_bytes"
+                self.result.skipped_external_domains.update(external_domains)
+                self.log_event(f"EXTERNAL skip domains={','.join(external_domains)} reason=max_bytes")
                 break
             seeds = sorted(
                 url for url in self.result.external_pages
                 if extract_base_domain(url) == domain
             )
             if not seeds:
+                visited_domains.add(domain)
                 continue
 
+            visited_domains.add(domain)
             domain_storage = self.storage.child(domain_folder_name(domain))
             self.log_event(
                 f"EXTERNAL domain_start domain={domain} seeds={len(seeds)}"
@@ -674,6 +719,7 @@ class SiteCrawler:
                 replace(
                     self.settings,
                     max_pages=remaining_pages,
+                    max_files=remaining_files,
                     max_file_size_mb=None,
                     max_download_bytes=remaining_bytes,
                 ),
@@ -685,23 +731,49 @@ class SiteCrawler:
                     else None
                 ),
                 additional_start_urls=seeds[1:],
+                http_get=self.http_get,
             )
+            child._deadline = self._deadline
             child.crawl()
             self.result.pages.update(child.result.pages)
+            self.result.linked_pages.update(child.result.linked_pages)
             self.result.files.update(child.result.files)
             self.result.linked_files.update(child.result.linked_files)
+            self.result.external_files.update(child.result.external_files)
+            self.result.external_pages.update(child.result.external_pages)
+            self.result.external_domains.update(child.result.external_domains)
             self.result.file_types.update(child.result.file_types)
             self.result.estimated_bytes += child.result.estimated_bytes
+            self.result.max_depth_reached = max(
+                self.result.max_depth_reached,
+                child.result.max_depth_reached,
+            )
             if remaining_pages is not None:
                 remaining_pages -= len(child.result.pages)
             if remaining_bytes is not None:
                 remaining_bytes -= child.result.estimated_bytes
+            if remaining_files is not None:
+                remaining_files -= len(
+                    child.result.linked_files
+                    | child.result.external_files
+                    | child.result.files
+                )
+            if child.result.limit_reason:
+                self.result.limit_reason = child.result.limit_reason
             self.log_event(
                 f"EXTERNAL domain_done domain={domain} pages={len(child.result.pages)} "
                 f"files={len(child.result.files)} bytes={child.result.estimated_bytes}"
             )
 
-        self.result.status = "complete" if not self.cancel_event else "cancelled"
+        if self.cancel_event:
+            self.result.status = "cancelled"
+        elif self._time_remaining() is not None and self._time_remaining() <= 0:
+            self.result.status = "time_limit"
+            self.result.limit_reason = "max_runtime_seconds"
+        elif self.result.limit_reason or self.result.skipped_external_domains:
+            self.result.status = "limit_reached"
+        else:
+            self.result.status = "complete"
         self._status = self.result.status
         self.log_event(
             f"EXTERNAL slut status={self.result.status} pages={len(self.result.pages)} "
@@ -717,8 +789,9 @@ def build_index(result: CrawlResult) -> dict:
         "linked_page_count": len(result.linked_pages),
         "linked_pages": sorted(result.linked_pages),
         "max_depth_reached": result.max_depth_reached,
-        "file_count": len(result.linked_files),
+        "file_count": len(result.linked_files | result.external_files),
         "downloaded_file_count": len(result.files),
+        "external_files": sorted(result.external_files),
         "file_types": dict(result.file_types),
         "external_domains": sorted(result.external_domains),
         "external_pages": sorted(result.external_pages),

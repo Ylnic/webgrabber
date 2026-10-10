@@ -30,8 +30,10 @@ def test_homepage_is_served_without_starting_crawler(tmp_path):
     assert status == 200
     assert headers["Content-Type"].startswith("text/html")
     assert b"WebGrabber" in body
-    assert b"upp till 200 sidor" in body
-    assert b"200 l\xc3\xa4nkade filer" in body
+    assert b"Ange bara webbplatsen" in body
+    assert b' name="max_pages"' not in body
+    assert b' name="max_depth"' not in body
+    assert b"200 filer" in body
     assert b"12 sekunder" in body
 
 
@@ -54,7 +56,10 @@ def test_post_rejects_private_ip_before_creating_job(tmp_path):
 
 @pytest.mark.parametrize(
     ("mode", "expected_files"),
-    [("text", []), ("all", ["https://example.com/guide.pdf"])],
+    [
+        ("text", []),
+        ("all", ["https://cdn.example.net/guide.pdf", "https://example.com/guide.pdf"]),
+    ],
 )
 def test_analysis_previews_then_returns_selected_zip(tmp_path, monkeypatch, mode, expected_files):
     def resolve(host, port):
@@ -74,6 +79,10 @@ def test_analysis_previews_then_returns_selected_zip(tmp_path, monkeypatch, mode
             pass
 
     def request_once(scheme, host, port, address, path, headers, timeout):
+        if host == "cdn.example.net" and path == "/guide.pdf":
+            return FakeHTTPResponse(b"PDF!", "application/pdf")
+        if host == "outside.example" and path == "/about":
+            return FakeHTTPResponse(b"<html><body>External page</body></html>")
         if path == "/robots.txt":
             return FakeHTTPResponse(b"User-agent: *\nAllow: /")
         if path == "/guide.pdf":
@@ -82,7 +91,10 @@ def test_analysis_previews_then_returns_selected_zip(tmp_path, monkeypatch, mode
             return FakeHTTPResponse(b"<html><body>About</body></html>")
         return FakeHTTPResponse(
             b'<html><body>Public page<a href="/about">About</a>'
-            b'<a href="/guide.pdf">Guide</a></body></html>'
+            b'<a href="/guide.pdf">Guide</a>'
+            b'<a href="https://outside.example/about">External</a>'
+            b'<a href="https://cdn.example.net/guide.pdf">External file</a>'
+            b'</body></html>'
         )
 
     monkeypatch.setattr(SafeHTTPClient, "_resolve_public_addresses", staticmethod(resolve))
@@ -105,8 +117,10 @@ def test_analysis_previews_then_returns_selected_zip(tmp_path, monkeypatch, mode
     assert headers["Content-Type"].startswith("text/html")
     assert "Hämta enbart text".encode() in preview
     assert "Hämta allt innehåll".encode() in preview
-    assert b"L\xc3\xa4nkade filer (max 200)</dt><dd>1</dd>" in preview
+    assert b"L\xc3\xa4nkade filer (max 200)</dt><dd>2</dd>" in preview
     assert b"Interna sidl\xc3\xa4nkar</dt><dd>1</dd>" in preview
+    assert b"https://outside.example/about" in preview
+    assert b"https://cdn.example.net/guide.pdf" in preview
     assert b"Maxdjup (0\xe2\x80\x935)" in preview
     job_id = re.search(rb'name="job_id" value="([A-Za-z0-9_-]{32})"', preview).group(1).decode()
     job_dir = storage_root / f"job-{job_id}"
@@ -133,7 +147,11 @@ def test_analysis_previews_then_returns_selected_zip(tmp_path, monkeypatch, mode
         assert "pages/index.html" in archive.namelist()
         manifest = json.loads(archive.read("manifest.json"))
         assert manifest["job_id"] in headers["Content-Disposition"]
-        assert manifest["pages"] == ["https://example.com/", "https://example.com/about"]
+        assert manifest["pages"] == [
+            "https://example.com/",
+            "https://example.com/about",
+            "https://outside.example/about",
+        ]
         assert manifest["files"] == expected_files
     assert not job_dir.exists()
 

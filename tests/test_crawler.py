@@ -629,6 +629,57 @@ def test_external_domain_crawl_uses_own_folder(monkeypatch, tmp_path):
     assert any(event[2] == "https://lyko.se/product" for event in progress)
 
 
+def test_external_domain_crawl_follows_other_domains_and_lists_external_files(tmp_path):
+    responses = {
+        "https://example.se/": (
+            '<a href="https://partner.example.org/start">Partner</a>'
+            '<a href="https://cdn.example.net/guide.pdf">PDF</a>'
+        ),
+        "https://partner.example.org/start": '<a href="https://other.example.com/page">Other</a>',
+        "https://other.example.com/page": "External page",
+    }
+    requested = []
+
+    def get_response(url, **kwargs):
+        requested.append(url)
+        body = responses.get(url, b"PDF")
+        if isinstance(body, str):
+            body = f"<html><body>{body}</body></html>".encode()
+            content_type = "text/html; charset=utf-8"
+        else:
+            content_type = "application/pdf"
+        return SimpleNamespace(
+            status_code=200,
+            headers={"Content-Type": content_type, "Content-Length": str(len(body))},
+            content=body,
+        )
+
+    crawler = SiteCrawler(
+        "https://example.se/",
+        DirectoryStorage(tmp_path),
+        CrawlSettings(max_pages=10, max_depth=2, max_files=10),
+        http_get=get_response,
+    )
+    crawler._is_allowed_by_robots = lambda url: True
+
+    result = crawler.crawl()
+    crawler.crawl_external_domains()
+
+    assert result.pages == {
+        "https://example.se/",
+        "https://partner.example.org/start",
+        "https://other.example.com/page",
+    }
+    assert result.external_files == {"https://cdn.example.net/guide.pdf"}
+    assert "https://other.example.com/page" in requested
+    assert "https://cdn.example.net/guide.pdf" not in requested
+
+    crawler.download_files()
+
+    assert "https://cdn.example.net/guide.pdf" in requested
+    assert (tmp_path / "files" / "guide.pdf").read_bytes() == b"PDF"
+
+
 def test_external_domains_are_reported_when_main_page_limit_is_exhausted(monkeypatch, tmp_path):
     monkeypatch.setattr(SiteCrawler, "_is_allowed_by_robots", lambda self, url: True)
     crawler = SiteCrawler(
@@ -714,5 +765,4 @@ def test_update_crawl_progress_is_determinate_when_pages_are_unlimited():
 
     assert values == [{"maximum": 11, "value": 5}]
     assert messages == ["5 sidor klara · obegränsat · 6 väntar"]
-
 
